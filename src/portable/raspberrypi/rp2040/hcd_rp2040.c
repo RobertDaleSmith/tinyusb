@@ -432,7 +432,8 @@ tusb_speed_t hcd_port_speed_get(uint8_t rhport)
       case 2:
           return TUSB_SPEED_FULL;
       default:
-          panic("Invalid speed\n");
+          // panic("Invalid speed\n");
+          printf("Invalid speed\n");
           return TUSB_SPEED_INVALID;
   }
 }
