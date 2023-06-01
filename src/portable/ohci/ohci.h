@@ -34,7 +34,7 @@
 //--------------------------------------------------------------------+
 // OHCI CONFIGURATION & CONSTANTS
 //--------------------------------------------------------------------+
-#define HOST_HCD_XFER_INTERRUPT // TODO interrupt is used widely, should always be enalbed
+#define HOST_HCD_XFER_INTERRUPT // TODO interrupt is used widely, should always be enabled
 #define OHCI_PERIODIC_LIST (defined HOST_HCD_XFER_INTERRUPT || defined HOST_HCD_XFER_ISOCHRONOUS)
 
 // TODO merge OHCI with EHCI
@@ -58,7 +58,9 @@ typedef struct {
 
 TU_VERIFY_STATIC( sizeof(ohci_hcca_t) == 256, "size is not correct" );
 
-typedef struct {
+// common link item for gtd and itd for list travel
+// use as pointer only
+typedef struct TU_ATTR_ALIGNED(16) {
   uint32_t reserved[2];
   volatile uint32_t next;
   uint32_t reserved2;
@@ -267,7 +269,7 @@ typedef volatile struct
   };
 
   union {
-    uint32_t rhport_status[OHCI_RHPORTS];
+    uint32_t rhport_status[TUP_OHCI_RHPORTS];
     struct {
       uint32_t current_connect_status             : 1;
       uint32_t port_enable_status                 : 1;
@@ -284,11 +286,11 @@ typedef volatile struct
       uint32_t port_over_current_indicator_change : 1;
       uint32_t port_reset_status_change           : 1;
       uint32_t TU_RESERVED                        : 11;
-    }rhport_status_bit[OHCI_RHPORTS];
+    }rhport_status_bit[TUP_OHCI_RHPORTS];
   };
 }ohci_registers_t;
 
-TU_VERIFY_STATIC( sizeof(ohci_registers_t) == (0x54 + (4 * OHCI_RHPORTS)), "size is not correct");
+TU_VERIFY_STATIC( sizeof(ohci_registers_t) == (0x54 + (4 * TUP_OHCI_RHPORTS)), "size is not correct");
 
 #ifdef __cplusplus
  }
