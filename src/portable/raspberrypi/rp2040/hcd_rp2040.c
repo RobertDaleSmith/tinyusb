@@ -26,6 +26,7 @@
  */
 
 #include "tusb_option.h"
+#include "hardware/watchdog.h"
 
 #if CFG_TUH_ENABLED && (CFG_TUSB_MCU == OPT_MCU_RP2040) && !CFG_TUH_RPI_PIO_USB
 
@@ -445,7 +446,11 @@ tusb_speed_t hcd_port_speed_get(uint8_t rhport)
     case 2:
       return TUSB_SPEED_FULL;
     default:
-      panic("Invalid speed\n");
+      printf("Invalid speed\n");
+      watchdog_enable(100, 1);
+      printf("Auto restart...\n");
+      while (1);
+      // panic("Invalid speed\n");
       // return TUSB_SPEED_INVALID;
   }
 }
