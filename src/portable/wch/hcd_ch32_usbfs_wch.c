@@ -35,6 +35,7 @@ typedef struct {
 
 static wch_dev_t s_dev[16];
 static uint8_t   s_root_speed = USB_FULL_SPEED;
+static bool      s_attached   = false;   // debounce DETECT — only fire on change
 
 // control-transfer staging: SETUP is buffered, the whole transfer runs on the
 // first EP0 data/status call via USBFSH_CtrlTransfer.
@@ -135,11 +136,16 @@ void hcd_device_close(uint8_t rhport, uint8_t dev_addr) {
 void hcd_int_handler(uint8_t rhport, bool in_isr) {
   if (USBFSH->INT_FG & USBFS_UIF_DETECT) {
     USBFSH->INT_FG = USBFS_UIF_DETECT;
-    if (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) {
-      // new device on the root port — speed sampled at reset_end
+    bool attached = (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) != 0;
+    // Only emit on a real state change. WCH's reset/transaction code toggles the
+    // DETECT flag, so an un-debounced handler would spew spurious attach/remove
+    // events mid-enumeration and storm the usbh queue.
+    if (attached && !s_attached) {
+      s_attached = true;
       s_dev[0].speed = s_root_speed;
       hcd_event_device_attach(rhport, in_isr);
-    } else {
+    } else if (!attached && s_attached) {
+      s_attached = false;
       hcd_event_device_remove(rhport, in_isr);
     }
   }
@@ -213,10 +219,17 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t *b
   if (epnum == 0) {
     // ---- control endpoint ----
     if (s_ctrl_pending && s_ctrl_daddr == dev_addr) {
-      // run the whole SETUP+DATA+STATUS via WCH's proven control transfer
+      // run the whole SETUP+DATA+STATUS via WCH's proven control transfer.
+      // Mask the USB IRQ across it: WCH's polled code toggles the DETECT flag,
+      // and an interrupt mid-transaction would fire a spurious remove/attach and
+      // restart enumeration. A REAL disconnect is reported by CtrlTransfer's
+      // return code, and any pending DETECT fires once we re-enable below.
       wch_select_dev(dev_addr);
+      NVIC_DisableIRQ(CH32_USBFS_IRQn);
       uint16_t got = 0;
       uint8_t  s   = USBFSH_CtrlTransfer(s_dev[dev_addr].ep0_size, buffer, &got);
+      USBFSH->INT_FG = USBFS_UIF_DETECT;   // swallow any DETECT toggled by the xfer
+      NVIC_EnableIRQ(CH32_USBFS_IRQn);
       s_ctrl_pending = false;
       hcd_event_xfer_complete(dev_addr, ep_addr, got, wch_err_to_result(s), false);
     } else {
