@@ -143,6 +143,11 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
     if (attached && !s_attached) {
       s_attached = true;
       s_dev[0].speed = s_root_speed;
+      // Disable the DETECT source now: WCH's polled reset/transaction code
+      // constantly toggles this flag, so leaving it on spews spurious removes
+      // mid-enumeration. Real disconnect is detected via transaction return
+      // codes (ERR_USB_DISCON) in hcd_edpt_xfer, which re-enables DETECT.
+      USBFSH->INT_EN = 0;
       hcd_event_device_attach(rhport, in_isr);
     } else if (!attached && s_attached) {
       s_attached = false;
@@ -161,8 +166,10 @@ bool hcd_edpt_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_endpoint_t const 
   s_dev[dev_addr].max_packet[epnum] = mps;
   if (epnum == 0) {
     s_dev[dev_addr].ep0_size = (mps < 8) ? 8 : (uint8_t) mps;
-    // a freshly-attached device inherits the root speed until addressed
-    if (s_dev[dev_addr].speed == 0 && dev_addr != 0) s_dev[dev_addr].speed = s_dev[0].speed;
+    // Always inherit the root-port speed (single-port host). NOTE: USB_LOW_SPEED
+    // is 0, so a "== 0 means uninitialized" test is wrong — it left LS devices in
+    // FS mode at address 1 and they stopped responding. (Hub tiers: TODO.)
+    s_dev[dev_addr].speed = s_dev[0].speed;
   }
   return true;
 }
@@ -224,6 +231,14 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t *b
       // and an interrupt mid-transaction would fire a spurious remove/attach and
       // restart enumeration. A REAL disconnect is reported by CtrlTransfer's
       // return code, and any pending DETECT fires once we re-enable below.
+      // Recover from a transient port-disable: WCH auto-clears PORT_EN on a
+      // disconnect-detect glitch (common on LS right after Set Address). If the
+      // device is still physically attached, re-enable the port before the xfer.
+      if ((USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) && !(USBFSH->HOST_CTRL & USBFS_UH_PORT_EN)) {
+        uint8_t sp = s_dev[dev_addr].speed;
+        USBFSH_EnableRootHubPort(&sp);
+        Delay_Ms(2);
+      }
       wch_select_dev(dev_addr);
       NVIC_DisableIRQ(CH32_USBFS_IRQn);
       uint16_t got = 0;
@@ -239,10 +254,20 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t *b
     return true;
   }
 
-  // ---- interrupt / bulk endpoint (MILESTONE 2: stubbed) ----
-  // TODO: SOF-driven polling. For now queue without completing so enumeration
-  //       and mount proceed; reports are added in the next pass.
-  (void) buffer; (void) buflen;
+  // ---- interrupt / bulk endpoint ----
+  // Single-shot poll, exactly like the proven standalone GetEndpData test (no
+  // IRQ-masking/flag-clearing — DETECT is already disabled while attached).
+  // NAK (idle) completes FAILED/0 and the app re-queues; data completes with bytes.
+  wch_select_dev(dev_addr);
+  uint16_t got = 0;
+  uint8_t  s;
+  if (ep_addr & 0x80) {
+    s = USBFSH_GetEndpData(epnum, &s_dev[dev_addr].in_tog[epnum], buffer, &got);
+  } else {
+    s = USBFSH_SendEndpData(epnum, &s_dev[dev_addr].out_tog[epnum], buffer, buflen);
+    got = buflen;
+  }
+  hcd_event_xfer_complete(dev_addr, ep_addr, got, wch_err_to_result(s), false);
   return true;
 }
 
