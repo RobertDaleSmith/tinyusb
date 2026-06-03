@@ -60,9 +60,18 @@ __attribute__((interrupt)) void USBHS_IRQHandler(void) {
   #endif
 }
 
-__attribute__((interrupt)) void OTG_FS_IRQHandler(void) {
-  #if CFG_TUD_WCH_USBIP_USBFS
+// The startup vector table names this vector USBFS_IRQHandler (OTG_FS_IRQn ==
+// USBFS_IRQn == 83 on CH32V307). The OTG_FS register block is shared between the
+// full-speed device (USBFSD) and host (USBFSH) views, so route the IRQ to
+// whichever stack owns the USBFS controller in this build. (Previously this was
+// named OTG_FS_IRQHandler, which is NOT the symbol the vector table references,
+// so it was never installed — host-on-USBFS got no interrupts.)
+__attribute__((interrupt)) void USBFS_IRQHandler(void) {
+  #if CFG_TUD_ENABLED && defined(CFG_TUD_WCH_USBIP_USBFS) && CFG_TUD_WCH_USBIP_USBFS
   tud_int_handler(0);
+  #endif
+  #if CFG_TUH_ENABLED && defined(CFG_TUH_WCH_USBIP_USBFS) && CFG_TUH_WCH_USBIP_USBFS
+  tuh_int_handler(BOARD_TUH_RHPORT, true);
   #endif
 }
 

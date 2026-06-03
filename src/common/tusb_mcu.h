@@ -564,6 +564,12 @@
   #define TUP_RHPORT_HIGHSPEED    CFG_TUD_WCH_USBIP_USBHS
   #define TUP_DCD_ENDPOINT_MAX    (CFG_TUD_WCH_USBIP_USBHS ? 16 : 8)
 
+  // Host: v307 has no USBHS host IP (no hcd_ch32_usbhs.c), only the USBFS host
+  // controller. Enable it so hcd_ch32_usbfs.c compiles in for host builds.
+  #if !defined(CFG_TUH_WCH_USBIP_USBFS)
+  #define CFG_TUH_WCH_USBIP_USBFS 1
+  #endif
+
 //--------------------------------------------------------------------+
 // Analog Devices
 //--------------------------------------------------------------------+
