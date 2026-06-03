@@ -27,7 +27,7 @@
 
 #include "tusb_option.h"
 
-#if CFG_TUH_ENABLED && defined(TUP_USBIP_WCH_USBFS) && CFG_TUH_WCH_USBIP_USBFS
+#if CFG_TUH_ENABLED && defined(TUP_USBIP_WCH_USBFS) && CFG_TUH_WCH_USBIP_USBFS && !(defined(CFG_TUH_WCH_BACKEND) && CFG_TUH_WCH_BACKEND)
 
   #include "ch32_usbfs_reg.h"
   #include "host/hcd.h"
