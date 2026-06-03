@@ -653,6 +653,12 @@
     #define TUP_DCD_EDPT_CLOSE_API
   #endif
 
+  // Host: v307 has no USBHS host IP (no hcd_ch32_usbhs.c), only the USBFS host
+  // controller. Enable it so hcd_ch32_usbfs.c compiles in for host builds.
+  #if !defined(CFG_TUH_WCH_USBIP_USBFS)
+  #define CFG_TUH_WCH_USBIP_USBFS 1
+  #endif
+
 //--------------------------------------------------------------------+
 // Analog Devices
 //--------------------------------------------------------------------+
