@@ -308,7 +308,6 @@ uint8_t USBFSH_Transact( uint8_t endp_pid, uint8_t endp_tog, uint32_t timeout )
             }
             
             r = USBFSH->INT_ST & USBFS_UIS_H_RES_MASK; // Response status of current USB transaction
-            printf("[T pid=%02x INT_ST=%02x r=%02x HCTRL=%02x rty=%d]\r\n", endp_pid, USBFSH->INT_ST, r, USBFSH->HOST_CTRL, trans_retry);
 
             if( r == USB_PID_STALL )
             {
