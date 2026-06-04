@@ -88,7 +88,18 @@ bool hcd_configure(uint8_t rhport, uint32_t cfg_id, const void *cfg_param) {
 
 uint32_t hcd_frame_number(uint8_t rhport) { (void) rhport; return 0; }
 
-void hcd_int_enable(uint8_t rhport)  { (void) rhport; NVIC_EnableIRQ(CH32_USBFS_IRQn); }
+void hcd_int_enable(uint8_t rhport)  {
+  NVIC_EnableIRQ(CH32_USBFS_IRQn);
+  // A device already attached at boot makes no fresh connect transition, so the
+  // DETECT interrupt never fires. hcd_int_enable is called repeatedly (per-event
+  // wrapper), so the first call that sees the device synthesizes the attach.
+  if (!s_attached && (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH)) {
+    s_attached = true;
+    s_dev[0].speed = s_root_speed;
+    USBFSH->INT_EN = 0;
+    hcd_event_device_attach(rhport, false);
+  }
+}
 void hcd_int_disable(uint8_t rhport) { (void) rhport; NVIC_DisableIRQ(CH32_USBFS_IRQn); }
 
 // ===========================================================================
@@ -166,10 +177,12 @@ bool hcd_edpt_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_endpoint_t const 
   s_dev[dev_addr].max_packet[epnum] = mps;
   if (epnum == 0) {
     s_dev[dev_addr].ep0_size = (mps < 8) ? 8 : (uint8_t) mps;
-    // Always inherit the root-port speed (single-port host). NOTE: USB_LOW_SPEED
-    // is 0, so a "== 0 means uninitialized" test is wrong — it left LS devices in
-    // FS mode at address 1 and they stopped responding. (Hub tiers: TODO.)
-    s_dev[dev_addr].speed = s_dev[0].speed;
+    // Inherit the latched ROOT-port speed (s_root_speed), NOT s_dev[0].speed:
+    // after Set Address, usbh calls hcd_device_close(0) which wipes s_dev[0] to
+    // 0 (== USB_LOW_SPEED), so inheriting from it forced every device to LS at
+    // address 1. (Worked for LS keyboards by luck; broke FS mice/controllers.)
+    // s_root_speed survives device_close. (Hub tiers: TODO.)
+    s_dev[dev_addr].speed = s_root_speed;
   }
   return true;
 }
