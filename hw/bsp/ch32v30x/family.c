@@ -95,7 +95,14 @@ void board_init(void) {
   __disable_irq();
 
 #if CFG_TUSB_OS == OPT_OS_NONE
-  SysTick_Config(SystemCoreClock / 1000);
+  // Free-running 64-bit SysTick (HCLK), no interrupt — must match the Joypad
+  // platform HAL (platform_ch32.c), which uses the same mode for platform_time_*.
+  // board_millis() reads CNT directly (below), so the 1ms SysTick interrupt is
+  // neither used nor wanted (platform_ch32 would disable it anyway).
+  SysTick->CTLR = 0;
+  SysTick->CNT  = 0;
+  SysTick->CMP  = 0xFFFFFFFFFFFFFFFFULL;
+  SysTick->CTLR = (1u << 0) | (1u << 2);
 #endif
 
   usart_printf_init(CFG_BOARD_UART_BAUDRATE);
@@ -153,7 +160,15 @@ __attribute__((interrupt)) void SysTick_Handler(void) {
 }
 
 uint32_t board_millis(void) {
-  return system_ticks;
+  // Derive ms from the free-running 64-bit SysTick CNT (HCLK rate) rather than
+  // the interrupt-driven `system_ticks`. Joypad's platform HAL (platform_ch32.c)
+  // reconfigures SysTick to free-running mode WITHOUT the 1ms interrupt, which
+  // freezes `system_ticks` — and every tusb_time_delay_ms_api() that waits on
+  // board_millis() would then hang forever (breaking host enumeration delays).
+  // CNT keeps advancing in either SysTick mode, so this is always correct.
+  uint32_t per_ms = SystemCoreClock / 1000u;
+  if (per_ms == 0) per_ms = 1;
+  return (uint32_t) ((uint64_t) SysTick->CNT / per_ms);
 }
 
 #endif

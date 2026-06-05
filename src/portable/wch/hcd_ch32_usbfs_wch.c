@@ -36,11 +36,28 @@ typedef struct {
 static wch_dev_t s_dev[16];
 static uint8_t   s_root_speed = USB_FULL_SPEED;
 static bool      s_attached   = false;   // debounce DETECT — only fire on change
+static uint8_t   s_rhport     = 0;       // host rhport (for task-context remove events)
+static uint16_t  s_in_miss    = 0;       // consecutive no-response IN polls → disconnect
+
+// Consecutive IN polls with NO device response (ERR_USB_UNKNOWN) before we treat
+// the device as unplugged. A connected-idle device NAKs (a real response) so it
+// never accumulates; only a physically-removed device gives zero response.
+#define CH32_HOST_DISCON_POLLS 16
 
 // control-transfer staging: SETUP is buffered, the whole transfer runs on the
 // first EP0 data/status call via USBFSH_CtrlTransfer.
 static bool      s_ctrl_pending = false;
 static uint8_t   s_ctrl_daddr   = 0;
+
+// Deferred interrupt-IN poll. Polling the IN endpoint inline in hcd_edpt_xfer and
+// completing inline makes usbh re-queue inline → infinite loop in tuh_task (the
+// loop never returns, no input ever surfaces). Instead we RECORD the request here
+// and poll it exactly once per main-loop iteration in ch32_hybrid_poll().
+static bool      s_in_pending = false;
+static uint8_t   s_in_daddr   = 0;
+static uint8_t   s_in_ep      = 0;
+static uint8_t  *s_in_buf     = NULL;
+static uint16_t  s_in_len     = 0;
 
 // ---- busy-loop delays used by the WCH transaction layer --------------------
 // (~SystemCoreClock-calibrated; USB timing is tolerant. SysTick is owned by the BSP.)
@@ -60,7 +77,8 @@ static inline void wch_select_dev(uint8_t daddr) {
 // Controller init
 // ===========================================================================
 bool hcd_init(uint8_t rhport, const tusb_rhport_init_t *rh_init) {
-  (void) rhport; (void) rh_init;
+  (void) rh_init;
+  s_rhport = rhport;
   tu_memclr(s_dev, sizeof(s_dev));
   for (int i = 0; i < 16; i++) s_dev[i].speed = USB_FULL_SPEED;
 
@@ -267,21 +285,60 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t *b
     return true;
   }
 
-  // ---- interrupt / bulk endpoint ----
-  // Single-shot poll, exactly like the proven standalone GetEndpData test (no
-  // IRQ-masking/flag-clearing — DETECT is already disabled while attached).
-  // NAK (idle) completes FAILED/0 and the app re-queues; data completes with bytes.
-  wch_select_dev(dev_addr);
-  uint16_t got = 0;
-  uint8_t  s;
+  // ---- interrupt IN: defer to the once-per-loop poll (see ch32_hybrid_poll) ----
   if (ep_addr & 0x80) {
-    s = USBFSH_GetEndpData(epnum, &s_dev[dev_addr].in_tog[epnum], buffer, &got);
-  } else {
-    s = USBFSH_SendEndpData(epnum, &s_dev[dev_addr].out_tog[epnum], buffer, buflen);
-    got = buflen;
+    s_in_daddr = dev_addr; s_in_ep = ep_addr; s_in_buf = buffer; s_in_len = buflen;
+    s_in_pending = true;
+    return true;  // completion is reported later from ch32_hybrid_poll()
   }
-  hcd_event_xfer_complete(dev_addr, ep_addr, got, wch_err_to_result(s), false);
+
+  // ---- interrupt/bulk OUT: rare (SET_REPORT etc.), keep inline ----
+  wch_select_dev(dev_addr);
+  uint8_t s = USBFSH_SendEndpData(epnum, &s_dev[dev_addr].out_tog[epnum], buffer, buflen);
+  hcd_event_xfer_complete(dev_addr, ep_addr, buflen, wch_err_to_result(s), false);
   return true;
+}
+
+// Poll the pending interrupt-IN transfer ONCE. Call from the main loop (task
+// context), not from tuh_task. NAK completes FAILED/0 (usbh re-queues, polled next
+// loop); data completes with the bytes. One poll per loop keeps the loop alive.
+void ch32_hybrid_poll(void) {
+  // The DETECT interrupt never fires on this chip, so attach state is polled here.
+  // When nothing is attached, watch DEV_ATTACH for a (re)plug and start enumeration.
+  // This is what makes hot-plug work after a disconnect — see the remove path below.
+  if (!s_attached) {
+    if (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) {
+      s_attached = true;
+      s_in_miss = 0;
+      hcd_event_device_attach(s_rhport, false);
+    }
+    return;
+  }
+
+  if (!s_in_pending) return;
+  s_in_pending = false;
+  uint8_t  daddr = s_in_daddr, ep = s_in_ep, epnum = tu_edpt_number(ep);
+  uint16_t got = 0;
+  wch_select_dev(daddr);
+  uint8_t s = USBFSH_GetEndpData(epnum, &s_dev[daddr].in_tog[epnum], s_in_buf, &got);
+
+  // Hot-unplug detection: a removed device gives NO response to the IN token (no
+  // transfer-complete IRQ → ERR_USB_UNKNOWN), whereas a connected-idle device NAKs
+  // (a genuine response, ERR_USB_TRANSFER|NAK). DEV_ATTACH is unreliable mid-run on
+  // this chip, so count consecutive no-response polls; past the threshold report a
+  // remove and re-arm attach polling so a replug re-enumerates.
+  if (s == ERR_USB_UNKNOWN) {
+    if (++s_in_miss >= CH32_HOST_DISCON_POLLS) {
+      s_in_miss = 0;
+      s_attached = false;
+      hcd_event_device_remove(s_rhport, false);
+      return;
+    }
+  } else {
+    s_in_miss = 0;
+  }
+
+  hcd_event_xfer_complete(daddr, ep, got, wch_err_to_result(s), false);
 }
 
 #endif
