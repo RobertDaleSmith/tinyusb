@@ -1,5 +1,5 @@
 #include "tusb_option.h"
-#if CFG_TUH_ENABLED && defined(TUP_USBIP_WCH_USBFS) && defined(CFG_TUH_WCH_BACKEND) && CFG_TUH_WCH_BACKEND
+#if CFG_TUH_ENABLED && defined(TUP_USBIP_WCH_USBFS) && CFG_TUH_WCH_USBIP_USBFS  /* TEMP: unguarded for vendor-LL diagnostic */
 
 /********************************** (C) COPYRIGHT *******************************
 * File Name          : ch32f20x_usbfs_host.c
