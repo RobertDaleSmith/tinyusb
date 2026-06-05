@@ -299,7 +299,7 @@ static void try_kick(void) {
 // Completion handling
 //--------------------------------------------------------------------+
 
-enum { CH32_OK, CH32_NAK, CH32_STALL, CH32_ERR };
+enum { CH32_OK, CH32_NAK, CH32_STALL, CH32_ERR, CH32_TIMEOUT };
 
 static uint8_t read_result(void) {
   uint8_t st = USBFSH->INT_ST;
@@ -307,6 +307,7 @@ static uint8_t read_result(void) {
   switch (st & USBFS_UIS_H_RES_MASK) {
     case USB_PID_NAK:   return CH32_NAK;
     case USB_PID_STALL: return CH32_STALL;
+    case USB_PID_NULL:  return CH32_TIMEOUT;          // 0 = no response / device timed out
     default:            return CH32_ERR;
   }
 }
@@ -352,7 +353,11 @@ static void handle_xfer_done(bool in_isr) {
   }
 
   uint8_t r = read_result();
-  _hcd.discon_polls = 0;                              // any real response resets
+  // Hot-unplug signal: a present device alternates NAK/data; a pulled device
+  // returns ONLY timeouts (H_RES=0). Count consecutive timeouts; the task poll
+  // declares the device gone past the threshold. Any real response resets it.
+  if (r == CH32_TIMEOUT) _hcd.discon_polls++;
+  else                   _hcd.discon_polls = 0;
 
   if (r == CH32_OK) {
     if (!ep->is_out) {
@@ -385,7 +390,11 @@ static void handle_xfer_done(bool in_isr) {
       if (done) xfer_complete(idx, XFER_RESULT_SUCCESS, in_isr);
       else      xact_inout(ep, false);
     }
-  } else if (r == CH32_NAK) {
+  } else if (r == CH32_NAK || r == CH32_TIMEOUT) {
+    // NAK = device not ready; TIMEOUT (H_RES=0) = no response this poll (an idle
+    // interrupt EP that doesn't even NAK between reports). Both mean "no data yet"
+    // -> back off and retry, NEVER complete the transfer (completing would make
+    // usbh re-queue and busy-loop the engine at bus rate).
     if (ep->ep_num == 0) {
       // Control: retry in place, do NOT yield the pipe (control owns it across
       // stages). Re-arm the same token at the current cursor.
@@ -728,39 +737,21 @@ void ch32_hybrid_poll(void) {
     return;
   }
 
-  // No-response disconnect: the engine arms a transaction and the transfer-done
-  // IRQ normally fires within a frame (a connected-idle device at least NAKs). If
-  // the engine stays armed across several frames with no completion, the device
-  // gave zero response -> count toward removal. DEV_ATTACH is unreliable mid-run.
-  hcd_int_disable(BOARD_TUH_RHPORT);
-  bool stuck = _hcd.armed &&
-               ((uint16_t)(_hcd.frame_count - _hcd.armed_frame) >= 3);
-  if (stuck) {
-    int8_t idx = _hcd.cur_idx;
-    // Tear down the dead transaction so the pipe frees for the next attempt.
-    USBFSH->HOST_EP_PID = 0;
-    _hcd.armed     = false;
-    _hcd.busy_lock = false;
-    if (idx >= 0) _hcd.ep[idx].state = EP_STATE_IDLE;
-    _hcd.cur_idx   = -1;
-
-    bool remove = (++_hcd.discon_polls >= CH32_HOST_DISCON_POLLS);
+  // No-response disconnect: handle_xfer_done counts consecutive timeouts (H_RES=0).
+  // A present device alternates NAK/data (resets the counter to 0); only a pulled
+  // device sustains timeouts. Past the threshold, tear down the engine and remove.
+  if (_hcd.discon_polls >= CH32_HOST_DISCON_POLLS) {
+    hcd_int_disable(BOARD_TUH_RHPORT);
+    USBFSH->HOST_EP_PID = 0;            // stop the dead transaction
+    _hcd.discon_polls = 0;
+    _hcd.attached     = false;
+    _hcd.busy_lock    = false;
+    _hcd.armed        = false;
+    _hcd.cur_idx      = -1;
     hcd_int_enable(BOARD_TUH_RHPORT);
-
-    if (idx >= 0) {
-      // Surface the failed poll so usbh re-queues (or tears the device down).
-      ch32_ep_t* ep = &_hcd.ep[idx];
-      uint8_t ep_addr = (uint8_t)(ep->ep_num | (ep->is_out ? 0 : TUSB_DIR_IN_MASK));
-      hcd_event_xfer_complete(ep->daddr, ep_addr, 0, XFER_RESULT_FAILED, false);
-    }
-    if (remove) {
-      _hcd.discon_polls = 0;
-      _hcd.attached     = false;
-      hcd_event_device_remove(BOARD_TUH_RHPORT, false);
-    }
-    return;
+    // usbh frees the device's EPs via hcd_device_close; re-arms attach polling.
+    hcd_event_device_remove(BOARD_TUH_RHPORT, false);
   }
-  hcd_int_enable(BOARD_TUH_RHPORT);
 }
 
 #endif
