@@ -15,7 +15,7 @@
  * the proven fork (the previous async hcd_ch32_usbfs.c which already enumerated
  * keyboard/mouse/8BitDo on this exact silicon). Only the scheduler shape is new.
  *
- * MIT (Joypad OS). Fork transaction code derived from Joel Michael's driver and
+ * Licensed MIT. Fork transaction code derived from Joel Michael's driver and
  * WCH's reference transaction layer.
  */
 

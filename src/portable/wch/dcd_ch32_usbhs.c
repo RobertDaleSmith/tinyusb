@@ -153,10 +153,10 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
 #if TUD_OPT_HIGH_SPEED
   USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_HIGH_SPEED;
 #else
-  // Full-speed: run the HS PHY at FS signaling (SPEED field = 00). Joypad output
-  // descriptors are FS-oriented (no device_qualifier / other-speed-config), so a
-  // host that brings the device up at 480Mbps rejects the HID interface. Forcing
-  // FS makes the same descriptors that work on RP2040 enumerate correctly here.
+  // Full-speed: run the HS PHY at FS signaling (SPEED field = 00). FS-only device
+  // descriptors (no device_qualifier / other-speed-config) cause a host that brings
+  // the device up at 480Mbps to reject the HID interface. Forcing FS lets those same
+  // descriptors enumerate correctly here.
   USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_FULL_SPEED;
 #endif
 
