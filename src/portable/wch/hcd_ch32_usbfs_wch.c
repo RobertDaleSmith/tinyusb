@@ -7,7 +7,7 @@
  * Model: SYNCHRONOUS. Control transfers run via USBFSH_CtrlTransfer inside the
  * host task; device attach/detach come from the USBFS DETECT interrupt.
  *
- * MIT (Joypad OS). Transaction layer (c) WCH.
+ * Licensed MIT. Transaction layer (c) WCH.
  */
 
 #include "tusb_option.h"

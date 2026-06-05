@@ -7,7 +7,7 @@
  * A TinyUSB HCD (hcd_ch32_usbfs_wch.c) wraps these so TinyUSB's whole host stack
  * runs on top of WCH's silicon-correct transaction layer.
  *
- * Transaction code (c) WCH; this thin config header is MIT (Joypad OS).
+ * Transaction code (c) WCH; this thin config header is MIT.
  */
 #ifndef WCH_USBFS_LL_H
 #define WCH_USBFS_LL_H
