@@ -168,6 +168,7 @@ static void ch32_hcd_trace_drain(void) {
     uint32_t w = _hcd.trace[_hcd.trace_tail];
     _hcd.trace_tail = (uint8_t)((_hcd.trace_tail + 1) % CH32_TRACE_DEPTH);
     TU_LOG3("ch32 trace %08lx\r\n", (unsigned long) w);
+    (void) w;  // used only by TU_LOG3, which compiles out at low log levels
   }
 }
 

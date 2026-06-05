@@ -80,16 +80,6 @@ __attribute__((interrupt)) void USBFS_IRQHandler(void) {
 // MACRO TYPEDEF CONSTANT ENUM
 //--------------------------------------------------------------------+
 
-static uint32_t SysTick_Config(uint32_t ticks) {
-  NVIC_EnableIRQ(SysTicK_IRQn);
-  SysTick->CTLR = 0;
-  SysTick->SR = 0;
-  SysTick->CNT = 0;
-  SysTick->CMP = ticks - 1;
-  SysTick->CTLR = 0xF;
-  return 0;
-}
-
 void board_init(void) {
 
   /* Disable interrupts during init */

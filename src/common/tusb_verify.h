@@ -97,8 +97,7 @@
   #if defined(CFG_TUSB_MCU) && (CFG_TUSB_MCU == OPT_MCU_CH32V307 || CFG_TUSB_MCU == OPT_MCU_CH32V20X || CFG_TUSB_MCU == OPT_MCU_CH32F20X)
     #define TU_BREAKPOINT() do {} while (0)
   #else
-    #define TU_BREAKPOINT() do { __asm("ebreak
-"); } while(0)
+    #define TU_BREAKPOINT() do { __asm("ebreak\n"); } while(0)
   #endif
 
 #elif defined(_mips)
