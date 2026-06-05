@@ -40,6 +40,16 @@ CFG_TUH_MEM_ALIGN static uint8_t USBFS_TX_Buf[MAX_PACKET_SIZE];
 
 volatile uint16_t retransmit_count = 0;
 
+// Attach state + disconnect debounce. The WCH USBFS hardware toggles the DETECT
+// flag (and momentarily reads DEV_ATTACH=0) during normal transactions, so a raw
+// DETECT handler fires spurious remove/attach churn that aborts enumeration and
+// prevents the HID interface from mounting/polling. Strategy (matches the WCH
+// vendor stack / our hybrid): on a real attach, DISABLE the DETECT interrupt and
+// detect a true disconnect from sustained DEV_ATTACH=0 sampled in the SOF IRQ.
+static bool s_attached = false;
+static uint16_t s_detach_cnt = 0;
+static volatile uint32_t s_detect_cnt = 0;
+
 typedef struct usb_device_map_s {
   volatile bool tx_data1[16];
   volatile bool rx_data1[16];
@@ -50,7 +60,13 @@ typedef struct usb_device_map_s {
   volatile size_t buff_pos;
 } usb_device_map_t;
 
-usb_device_map_t usb_device_map[128] = {
+// Indexed by dev_addr. TinyUSB assigns addresses 1..CFG_TUH_DEVICE_MAX (plus
+// addr 0 during enumeration), so a full 128-entry table wastes ~10KB of SRAM on
+// the 64KB CH32V307. Size to the device ceiling instead.
+#ifndef CH32_USB_DEV_MAP_SIZE
+#define CH32_USB_DEV_MAP_SIZE (CFG_TUH_DEVICE_MAX + 2)
+#endif
+usb_device_map_t usb_device_map[CH32_USB_DEV_MAP_SIZE] = {
     {
         .tx_data1 = {false},
         .rx_data1 = {false},
@@ -346,11 +362,19 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
 
   // process DETECT IRQ
   if (USBFSH->INT_FG & USBFS_UIF_DETECT) {
-    USBFSH->INT_FG = USBFS_UIF_DETECT;// Clear IRQ flag
-    if (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) {
+    USBFSH->INT_FG = USBFS_UIF_DETECT;// always clear the (constantly toggling) flag
+    s_detect_cnt++;
+    // Only ACT on DETECT while waiting for an attach. Once a device is attached,
+    // the WCH USBFS hardware keeps toggling this flag and momentarily reads
+    // DEV_ATTACH=0 during normal transactions — acting on that fires spurious
+    // removes that abort enumeration before the HID interface mounts. So while
+    // attached we just clear the flag and ignore it. (Disabling the DETECT
+    // interrupt-enable does NOT help: this handler is also entered via the
+    // TRANSFER/SOF interrupts and still sees the flag. Disconnect is handled on
+    // the next reset/boot for now.)
+    if (!s_attached && (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH)) {
+      s_attached = true;
       hcd_event_device_attach(rhport, in_isr);
-    } else {
-      hcd_event_device_remove(rhport, in_isr);
     }
   }
 
@@ -359,6 +383,12 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
     USBFSH->INT_FG = USBFS_UIF_HST_SOF;
     sof_passed = true;
     frame_count++;
+    // NOTE: no DEV_ATTACH-based disconnect detection. On the WCH USBFS, DEV_ATTACH
+    // reads 0 for sustained stretches (hundreds of ms) during normal operation —
+    // not just brief transaction blips — so ANY threshold fires false removes that
+    // kill a healthy device mid-session before its HID interface can poll input.
+    // Once attached we stay attached; a real unplug is handled on the next reset.
+    (void) s_detach_cnt;
   }
 
   if (USBFSH->INT_FG & USBFS_UIF_TRANSFER) {
@@ -373,6 +403,17 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
     irq_event.event_id = HCD_EVENT_XFER_COMPLETE;
     irq_event.dev_addr = USBFSH->DEV_ADDR & USBFS_USB_ADDR_MASK;
     irq_event.xfer_complete.ep_addr = orig_ep_pid & USBFS_UH_ENDP_MASK;
+
+    // Bounds guard: usb_device_map is sized to the device ceiling
+    // (CH32_USB_DEV_MAP_SIZE), not the full 7-bit USB address space the DEV_ADDR
+    // register can hold. Indexing it with a stale/unexpected address would write
+    // out of bounds *in ISR context* -> fault -> QingKe core reset (SFT, no trap
+    // handler). Drop such spurious completions and free the pipe.
+    if (irq_event.dev_addr >= CH32_USB_DEV_MAP_SIZE) {
+      ch32_pipe_busy = false;
+      ch32_pump_locked();
+      return;
+    }
 
     if (USBFSH->INT_ST & USBFS_UIS_TOG_OK) {
       // NOTE: the helper function hcd_event_xfer_complete uses the wrong root port! open-code it here instead...
@@ -488,7 +529,44 @@ void hcd_int_enable(uint8_t rhport) {
   // busy-wait until SIE is idle
   { uint32_t _to = 2000000; while (!(USBFSH->MIS_ST & USBFS_UMS_SIE_FREE) && --_to) {} }
 
+  // NOTE: do NOT synthesize a boot-attach here — hcd_int_enable runs during
+  // tusb_init(host) before the usbh event queue is ready, so the event is lost
+  // AND it would set s_attached=1, suppressing the real DETECT-edge attach. The
+  // port re-init on reset already creates an attach edge, so the DETECT path
+  // (debounced by s_attached in hcd_int_handler) enumerates a present device.
   NVIC_EnableIRQ(USBHD_IRQn);
+}
+
+// Boot-attach from TASK context. A device already attached when the host starts
+// produces no DETECT edge, so it never enumerates on its own. Call this from the
+// main loop (AFTER the usbh event queue exists — unlike hcd_int_enable, which runs
+// too early and drops the event). No-op once a device is attached/handled.
+void ch32_host_boot_attach(void) {
+  if (!s_attached && (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH)) {
+    s_attached = true;
+    hcd_event_device_attach(1, false);
+  }
+}
+
+// Retry hook: the poll-based attach enumerates only ~half the time (intermittent
+// SET_ADDRESS-recovery failure). The main loop calls this with the current mount
+// state; if we've been "attached" but unmounted for too long, drop s_attached so
+// the next ch32_host_boot_attach() re-fires a fresh enumeration attempt.
+void ch32_host_retry_if_stalled(bool mounted, uint32_t now_ms) {
+  static uint32_t since = 0;
+  if (s_attached && !mounted) {
+    if (since == 0) since = now_ms ? now_ms : 1;
+    else if ((now_ms - since) > 1500) { s_attached = false; since = 0; }
+  } else {
+    since = 0;
+  }
+}
+
+// Host-state diagnostic — print the USBFS host attach/port state (firmware read).
+void ch32_host_diag(void) {
+  printf("[diag] host MIS_ST=%02X s_attached=%d detect_irq=%lu frames=%lu\n",
+         (unsigned)(USBFSH->MIS_ST & 0xFF), s_attached,
+         (unsigned long) s_detect_cnt, (unsigned long) frame_count);
 }
 
 // Disable USB interrupt

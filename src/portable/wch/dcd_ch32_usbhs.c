@@ -181,6 +181,14 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t *rh_init) {
   memset(ep_data_tog, 0, sizeof(ep_data_tog));
   ep0_tog = true;
 
+  // Reset the USB SIE first (USBHS_UC_RESET_SIE|USBHS_UC_CLR_ALL = 0x06), as the
+  // WCH vendor USBHS_Device_Init does. TinyUSB's dcd_init skipped this; a stale
+  // SIE state (e.g. left by prior USBFS host activity on the shared chip) can
+  // leave the device unable to detect bus traffic even with the pullup enabled.
+  USBHSD->CONTROL = 0x06;
+  for (volatile uint32_t _d = 0; _d < 4000; _d++) { __asm volatile("nop"); }
+  USBHSD->CONTROL = 0;
+
   USBHSD->HOST_CTRL = 0x00;
   USBHSD->HOST_CTRL = USBHS_PHY_SUSPENDM;
 
@@ -189,7 +197,10 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t *rh_init) {
   #if TUD_OPT_HIGH_SPEED
   USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_HIGH_SPEED;
   #else
-    #error OPT_MODE_FULL_SPEED not currently supported on CH32
+  // Full-speed: run the HS PHY at FS signaling (SPEED field = 00). Joypad output
+  // descriptors are FS-oriented (no device_qualifier / other-speed-config), so a
+  // host that brings the device up at 480Mbps rejects the HID interface. Forcing
+  // FS makes the same descriptors that work on RP2040 enumerate correctly here.
   USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_FULL_SPEED;
   #endif
 
@@ -227,6 +238,18 @@ void dcd_int_enable(uint8_t rhport) {
 void dcd_int_disable(uint8_t rhport) {
   (void)rhport;
   NVIC_DisableIRQ(USBHS_IRQn);
+}
+
+// Toggle the D+ pull-up so the device can re-enumerate without a reboot (used by
+// CH32 live USB-mode switching, where RAM-backed flash can't survive a reset).
+void dcd_disconnect(uint8_t rhport) {
+  (void) rhport;
+  USBHSD->CONTROL &= ~USBHS_DEV_PU_EN;
+}
+
+void dcd_connect(uint8_t rhport) {
+  (void) rhport;
+  USBHSD->CONTROL |= USBHS_DEV_PU_EN;
 }
 
 void dcd_edpt_close_all(uint8_t rhport) {
@@ -453,7 +476,11 @@ void dcd_int_handler(uint8_t rhport) {
     //    }
     //    dcd_event_bus_reset(0, actual_speed, true);
 
+#if TUD_OPT_HIGH_SPEED
     dcd_event_bus_reset(0, TUSB_SPEED_HIGH, true);
+#else
+    dcd_event_bus_reset(0, TUSB_SPEED_FULL, true);
+#endif
 
     USBHSD->DEV_AD = 0;
     memset(ep_data_tog, 0, sizeof(ep_data_tog));
