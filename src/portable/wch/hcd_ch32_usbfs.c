@@ -99,6 +99,11 @@ typedef struct TU_ATTR_PACKED {
   uint16_t xferred_len;      // bytes done so far
   uint8_t* buf;              // caller buffer base (cursor = buf + xferred_len)
 
+  // interrupt-EP interval pacing: poll only when frame_count >= next_frame, then
+  // re-arm at +interval. interval=1 (control/bulk) polls every frame.
+  uint8_t  interval;         // bInterval in frames (interrupt); 1 otherwise
+  uint16_t next_frame;       // earliest frame this EP may be polled again
+
   uint8_t  setup[8];         // staged 8-byte SETUP packet (ep0 only)
 } ch32_ep_t;
 
@@ -182,8 +187,9 @@ static void free_ep_daddr(uint8_t daddr) {
 
 static inline bool is_ep_pending(const ch32_ep_t* ep) {
   if (ep->packet_size == 0 || ep->state < EP_STATE_ATTEMPT_1) return false;
-  return (CFG_TUH_CH32_NAK_MAX == 0) ||
-         (ep->state < EP_STATE_ATTEMPT_1 + CFG_TUH_CH32_NAK_MAX);
+  // Interval gate: an EP that NAKed/timed out is re-pollable only once its
+  // bInterval has elapsed (signed diff handles frame_count wrap).
+  return (int16_t)(_hcd.frame_count - ep->next_frame) >= 0;
 }
 
 // Round-robin scan starting AFTER cur so no endpoint monopolizes the engine.
@@ -401,8 +407,9 @@ static void handle_xfer_done(bool in_isr) {
       if (ep->is_setup) xact_setup(ep);
       else              xact_inout(ep, false);
     } else {
-      // Other EPs: bump the NAK counter, back off to let other EPs run.
-      if (ep->state < EP_STATE_ATTEMPT_MAX) ep->state++;
+      // Interrupt/bulk: no data this poll. Re-schedule at the EP's bInterval (so
+      // we don't hammer the bus every frame) and let other EPs run meanwhile.
+      ep->next_frame = (uint16_t)(_hcd.frame_count + ep->interval);
       int8_t nxt = find_next_pending(idx);
       if (nxt < 0) {
         _hcd.busy_lock = false;
@@ -438,20 +445,18 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
     USBFSH->INT_FG = USBFS_UIF_DETECT;
   }
 
-  // 1ms frame tick: bump the counter and refresh per-EP NAK budgets. If the
-  // engine is idle and an EP became pending again, kick it.
+  // 1ms frame tick: advance the frame counter, then (if idle) kick the next EP
+  // whose interval has elapsed. Per-EP pacing lives in is_ep_pending(next_frame),
+  // so the engine naturally polls each interrupt EP at its bInterval.
   if (fg & USBFS_UIF_HST_SOF) {
     USBFSH->INT_FG = USBFS_UIF_HST_SOF;
     _hcd.frame_count++;
-    int8_t first = -1;
-    for (uint8_t i = 0; i < CFG_TUH_CH32_ENDPOINT_TOTAL; i++) {
-      ch32_ep_t* ep = &_hcd.ep[i];
-      if (ep->state > EP_STATE_ATTEMPT_1) ep->state = EP_STATE_ATTEMPT_1;  // fresh budget
-      if (first < 0 && is_ep_pending(ep)) first = (int8_t) i;
-    }
-    if (!_hcd.busy_lock && first >= 0) {
-      _hcd.busy_lock = true;
-      launch_ep(first, true);
+    if (!_hcd.busy_lock) {
+      int8_t first = find_next_pending(_hcd.cur_idx);
+      if (first >= 0) {
+        _hcd.busy_lock = true;
+        launch_ep(first, true);
+      }
     }
   }
 
@@ -626,6 +631,10 @@ bool hcd_edpt_open(uint8_t rhport, uint8_t daddr, const tusb_desc_endpoint_t* ep
   ep->data_toggle = 0;
   ep->state       = EP_STATE_IDLE;
   ep->pid         = (uint8_t)(((ep->is_out ? USB_PID_OUT : USB_PID_IN) << 4) | ep_num);
+  // Interrupt EPs poll at their bInterval (frames); control/bulk poll every frame.
+  ep->interval    = (ep_desc->bmAttributes.xfer == TUSB_XFER_INTERRUPT && ep_desc->bInterval)
+                    ? ep_desc->bInterval : 1;
+  ep->next_frame  = 0;                                 // pollable immediately
   return true;
 }
 
@@ -650,6 +659,7 @@ bool hcd_setup_send(uint8_t rhport, uint8_t daddr, const uint8_t setup_packet[8]
   ep->xferred_len = 0;
   ep->pid         = (uint8_t)((USB_PID_SETUP << 4) | 0);
   ep->state       = EP_STATE_ATTEMPT_1;
+  ep->next_frame  = _hcd.frame_count;                  // poll now
   memcpy(ep->setup, setup_packet, 8);
 
   hcd_int_disable(rhport);
@@ -680,6 +690,7 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t daddr, uint8_t ep_addr,
   ep->total_len   = buflen;
   ep->xferred_len = 0;
   ep->state       = EP_STATE_ATTEMPT_1;
+  ep->next_frame  = _hcd.frame_count;                  // first poll this frame
 
   hcd_int_disable(rhport);
   try_kick();
