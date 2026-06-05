@@ -131,9 +131,27 @@ typedef struct {
 
 static ch32_hcd_t _hcd;
 
+// Shims for the vendor LL (wch_usbfs_ll.c), which calls the WCH SDK Delay_Us/Ms.
+// Core clock ~144MHz; the busy-loop only needs to be in the right ballpark for the
+// LL's inter-stage settles and transaction spin timeouts.
+void Delay_Ms(uint32_t n) { tusb_time_delay_ms_api(n); }
+void Delay_Us(uint32_t n) { for (volatile uint32_t i = 0; i < n * 24u; i++) { __asm__ volatile("nop"); } }
+
 // DMA buffers (set once at init). Aligned, must live in SRAM the USB DMA reaches.
-CFG_TUH_MEM_ALIGN static uint8_t USBFS_RX_Buf[MAX_PACKET_SIZE];
-CFG_TUH_MEM_ALIGN static uint8_t USBFS_TX_Buf[MAX_PACKET_SIZE];
+// Shared with the vendor LL (wch_usbfs_ll.c): control transfers run through the
+// proven synchronous USBFSH_CtrlTransfer, which uses these exact buffers. Sharing
+// them means the host DMA never has to be re-pointed between control and interrupt.
+extern uint8_t USBFS_RX_Buf[MAX_PACKET_SIZE];
+extern uint8_t USBFS_TX_Buf[MAX_PACKET_SIZE];
+
+// Vendor LL control primitives (wch_usbfs_ll.c is unguarded for this backend). The
+// async ep[] engine drives INTERRUPT EPs; CONTROL goes through the WCH synchronous
+// path, which enumerates hubs/devices the raw async SETUP could not.
+extern uint8_t USBFSH_CtrlTransfer(uint8_t ep0_size, uint8_t *pbuf, uint16_t *plen);
+extern uint8_t USBFSH_EnableRootHubPort(uint8_t *pspeed);
+extern void    USBFSH_ResetRootHubPort(uint8_t mode);
+static bool    s_ctrl_pending = false;
+static uint8_t s_ctrl_daddr   = 0;
 
 //--------------------------------------------------------------------+
 // Trace ring (ISR-safe; drained in task context)
@@ -359,11 +377,15 @@ static void handle_xfer_done(bool in_isr) {
   }
 
   uint8_t r = read_result();
-  // Hot-unplug signal: a present device alternates NAK/data; a pulled device
-  // returns ONLY timeouts (H_RES=0). Count consecutive timeouts; the task poll
-  // declares the device gone past the threshold. Any real response resets it.
-  if (r == CH32_TIMEOUT) _hcd.discon_polls++;
-  else                   _hcd.discon_polls = 0;
+  // Hot-unplug signal: a present device's INTERRUPT poll alternates NAK/data; a
+  // pulled device returns ONLY timeouts. Count consecutive interrupt-EP timeouts;
+  // the task poll declares the device gone past the threshold. NOTE: control (ep0)
+  // timeouts during enumeration must NOT gate disconnect — a slow-to-enumerate hub
+  // would be false-removed. Only steady-state interrupt/bulk polling counts.
+  if (ep->ep_num != 0) {
+    if (r == CH32_TIMEOUT) _hcd.discon_polls++;
+    else                   _hcd.discon_polls = 0;
+  }
 
   if (r == CH32_OK) {
     if (!ep->is_out) {
@@ -500,6 +522,12 @@ bool hcd_init(uint8_t rhport, const tusb_rhport_init_t* rh_init) {
   USBFSH->HOST_TX_CTRL = 0;
   USBFSH->INT_FG       = 0xFF;
   USBFSH->BASE_CTRL    = USBFS_CTRL_HOST_MODE | USBFS_CTRL_INT_BUSY | USBFS_CTRL_DMA_EN;
+  // Source VBUS to the downstream device (OTG_CR CHARGE_VBUS, bit1). Without it,
+  // bus-powered devices brown out: a lone controller (PSC) and a self-powered hub
+  // survive on residual rail, but bus-powered hubs draw more and never answer the
+  // first SETUP. The WCH LL USBFS_Host_Init sets this; the async init had dropped
+  // it. CHARGE_VBUS only — no OTG_EN session gating.
+  USBFSH->OTG_CR       = 0x02u;  // USBFS_CR_CHARGE_VBUS
 
   hcd_int_enable(rhport);
   USBFSH->INT_EN = USBFS_INT_EN_HST_SOF | USBFS_INT_EN_TRANSFER | USBFS_INT_EN_DETECT;
@@ -541,49 +569,31 @@ bool hcd_port_connect_status(uint8_t rhport) {
 // Begin bus reset. usbh calls hcd_port_reset_end() ~10-50ms later. Keep the
 // fork's 100ms attach debounce before reset (complex controllers boot slower).
 void hcd_port_reset(uint8_t rhport) {
-  // USB spec debounce is ~100ms before reset.
+  // USB spec debounce is ~100ms before reset. The actual reset PULSE is issued in
+  // reset_end via the vendor routine (a tight blocking 11ms pulse) — CtrlTransfer
+  // only succeeds after the vendor's own reset/enable sequence.
   tusb_time_delay_ms_api(100);
-
   hcd_int_disable(rhport);
-
-  // reset device address to 0, force full speed for the reset pulse
-  USBFSH->DEV_ADDR    = (uint8_t)(USBFSH->DEV_ADDR & USBFS_UDA_GP_BIT);
-  USBFSH->BASE_CTRL  &= ~USBFS_CTRL_LOW_SPEED;
-  USBFSH->HOST_CTRL  &= ~USBFS_UH_LOW_SPEED;
-  USBFSH->HOST_SETUP &= ~USBFS_UH_PRE_PID_EN;
-
-  USBFSH->HOST_CTRL  |= USBFS_UH_BUS_RESET;            // start bus reset
 }
 
 void hcd_port_reset_end(uint8_t rhport) {
-  USBFSH->HOST_CTRL &= ~USBFS_UH_BUS_RESET;            // end reset
-  tusb_time_delay_ms_api(10);
-  CH32_WAIT_SIE_IDLE();
+  // Vendor reset + enable: USBFSH_ResetRootHubPort(0) does SetAddr0 + force-FS +
+  // an 11ms BUS_RESET pulse + DETECT-swallow; EnableRootHubPort enables PORT_EN +
+  // SOF and reads the speed. This is the exact sequence the WCH host stack uses,
+  // and the one CtrlTransfer needs to get a handshake from hubs.
+  USBFSH_ResetRootHubPort(0);
 
-  // swallow the spurious DETECT toggled by the reset
-  if ((USBFSH->INT_FG & USBFS_UIF_DETECT) && (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH)) {
-    USBFSH->INT_FG = USBFS_UIF_DETECT;
+  uint8_t sp = 0x01;                                   // USB_FULL_SPEED
+  for (int i = 0; i < 20; i++) {
+    if (USBFSH_EnableRootHubPort(&sp) == 0 /*ERR_SUCCESS*/) break;
+    tusb_time_delay_ms_api(1);
   }
+  // USB_FULL_SPEED==1 -> TUSB_SPEED_FULL(0); USB_LOW_SPEED==0 -> TUSB_SPEED_LOW(1).
+  _hcd.root_speed = (sp == 0x00) ? TUSB_SPEED_LOW : TUSB_SPEED_FULL;
 
-  if (USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) {
-    // Latch the ROOT speed (survives device_close). Never the speed==0 trap.
-    bool low = (USBFSH->MIS_ST & USBFS_UMS_DM_LEVEL) != 0;
-    _hcd.root_speed = low ? TUSB_SPEED_LOW : TUSB_SPEED_FULL;
-
-    if ((USBFSH->HOST_CTRL & USBFS_UH_PORT_EN) == 0x00) {
-      if (low) {
-        USBFSH->BASE_CTRL  |= USBFS_UC_LOW_SPEED;
-        USBFSH->HOST_CTRL  |= USBFS_UH_LOW_SPEED;
-        USBFSH->HOST_SETUP |= USBFS_UH_PRE_PID_EN;
-      }
-    }
-    USBFSH->HOST_CTRL  |= USBFS_UH_PORT_EN;
-    USBFSH->HOST_SETUP |= USBFS_UH_SOF_EN;
-
-    // Let SOF run so slow controllers (DualSense, XInput pads) can power up their
-    // USB engine before the first SETUP. Bus is active, so no suspend risk.
-    tusb_time_delay_ms_api(200);
-  }
+  // Let SOF run so slow controllers can power up their USB engine before the
+  // first SETUP. Bus is active (SOF on), so no suspend risk.
+  tusb_time_delay_ms_api(200);
 
   USBFSH->HOST_RX_DMA = (uint32_t) USBFS_RX_Buf;
   USBFSH->HOST_TX_DMA = (uint32_t) USBFS_TX_Buf;
@@ -648,23 +658,14 @@ bool hcd_edpt_close(uint8_t rhport, uint8_t daddr, uint8_t ep_addr) {
 
 bool hcd_setup_send(uint8_t rhport, uint8_t daddr, const uint8_t setup_packet[8]) {
   (void) rhport;
-  ch32_ep_t* ep = find_ep(daddr, 0, 0);
-  TU_ASSERT(ep);
-
-  ep->is_out      = 1;
-  ep->is_setup    = 1;
-  ep->data_toggle = 0;                               // SETUP DATA0
-  ep->buf         = NULL;
-  ep->total_len   = 8;
-  ep->xferred_len = 0;
-  ep->pid         = (uint8_t)((USB_PID_SETUP << 4) | 0);
-  ep->state       = EP_STATE_ATTEMPT_1;
-  ep->next_frame  = _hcd.frame_count;                  // poll now
-  memcpy(ep->setup, setup_packet, 8);
-
-  hcd_int_disable(rhport);
-  try_kick();
-  hcd_int_enable(rhport);
+  // CONTROL runs through the vendor LL (USBFSH_CtrlTransfer reads the SETUP from
+  // USBFS_TX_Buf, which pUSBFS_SetupRequest aliases). Stage it and tell usbh the
+  // SETUP "completed" so it advances to the data/status stage, where we run the
+  // whole transfer at once. (Mirrors the hybrid HCD.)
+  memcpy(USBFS_TX_Buf, setup_packet, 8);
+  s_ctrl_pending = true;
+  s_ctrl_daddr   = daddr;
+  hcd_event_xfer_complete(daddr, 0, 8, XFER_RESULT_SUCCESS, false);
   return true;
 }
 
@@ -675,17 +676,43 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t daddr, uint8_t ep_addr,
 
   uint8_t ep_num = tu_edpt_number(ep_addr);
   uint8_t dir    = tu_edpt_dir(ep_addr);
-  ch32_ep_t* ep  = find_ep(daddr, ep_num, dir);
-  TU_ASSERT(ep);
 
   if (ep_num == 0) {
-    // ep0 direction flips per control stage; data/status are always DATA1.
-    ep->is_out      = (dir == TUSB_DIR_OUT);
-    ep->is_setup    = 0;
-    ep->data_toggle = 1;
-    ep->pid         = (uint8_t)(((ep->is_out ? USB_PID_OUT : USB_PID_IN) << 4) | 0);
+    // ---- control endpoint: run SETUP+DATA+STATUS via the vendor LL ----
+    if (s_ctrl_pending && s_ctrl_daddr == daddr) {
+      hcd_int_disable(rhport);
+      // Quiesce the async engine so the SIE is free for the synchronous transfer.
+      USBFSH->HOST_EP_PID = 0;
+      CH32_WAIT_SIE_IDLE();
+      _hcd.busy_lock = false; _hcd.cur_idx = -1; _hcd.armed = false;
+      // Recover a port the WCH auto-cleared on a disconnect-detect glitch.
+      if ((USBFSH->MIS_ST & USBFS_UMS_DEV_ATTACH) && !(USBFSH->HOST_CTRL & USBFS_UH_PORT_EN)) {
+        uint8_t sp = (uint8_t)(_hcd.root_speed == TUSB_SPEED_LOW ? 0 : 1);
+        USBFSH_EnableRootHubPort(&sp);
+        tusb_time_delay_ms_api(2);
+      }
+      select_dev(daddr);
+      ch32_ep_t* e0 = find_ep(daddr, 0, 0);
+      uint8_t  ep0sz = (e0 && e0->packet_size) ? (uint8_t) e0->packet_size : 8;
+      uint16_t got   = 0;
+      uint8_t  s     = USBFSH_CtrlTransfer(ep0sz, buffer, &got);
+      USBFSH->INT_FG = USBFS_UIF_DETECT;                  // swallow DETECT it toggled
+      s_ctrl_pending = false;
+      hcd_int_enable(rhport);
+      xfer_result_t r = (s == 0)                                 ? XFER_RESULT_SUCCESS
+                      : (((s & 0x0F) == USB_PID_STALL)           ? XFER_RESULT_STALLED
+                                                                 : XFER_RESULT_FAILED);
+      hcd_event_xfer_complete(daddr, ep_addr, got, r, false);
+    } else {
+      // status stage already done inside CtrlTransfer -> complete immediately.
+      hcd_event_xfer_complete(daddr, ep_addr, 0, XFER_RESULT_SUCCESS, false);
+    }
+    return true;
   }
 
+  // ---- interrupt / bulk: async ep[] scheduler ----
+  ch32_ep_t* ep = find_ep(daddr, ep_num, dir);
+  TU_ASSERT(ep);
   ep->buf         = buffer;
   ep->total_len   = buflen;
   ep->xferred_len = 0;
